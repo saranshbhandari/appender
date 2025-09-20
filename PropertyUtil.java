@@ -1,31 +1,14 @@
-public class PropertyUtil {
+@Component
+public class SpringPropertyBridge implements EnvironmentAware {
 
-    private static final Properties props = new Properties();
+    private static Environment env;
 
-    static {
-        try {
-            // Load base
-            try (InputStream base = PropertyUtil.class.getClassLoader()
-                    .getResourceAsStream("application.properties")) {
-                if (base != null) props.load(base);
-            }
-
-            // Check for profile
-            String profile = System.getProperty("spring.profiles.active",
-                    System.getenv("SPRING_PROFILES_ACTIVE"));
-
-            if (profile != null) {
-                try (InputStream prof = PropertyUtil.class.getClassLoader()
-                        .getResourceAsStream("application-" + profile + ".properties")) {
-                    if (prof != null) props.load(prof);
-                }
-            }
-        } catch (IOException e) {
-            throw new RuntimeException("Could not load properties", e);
-        }
+    @Override
+    public void setEnvironment(Environment environment) {
+        env = environment;
     }
 
     public static String get(String key) {
-        return props.getProperty(key);
+        return env.getProperty(key);
     }
 }
