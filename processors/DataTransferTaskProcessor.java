@@ -1,4 +1,3 @@
-
 package com.test.dataflowengine.processors;
 
 import com.test.dataflowengine.factories.ConnectionPoolFactory;
@@ -9,10 +8,11 @@ import com.test.dataflowengine.models.enums.DataEndpointType;
 import com.test.dataflowengine.models.settings.*;
 import com.test.dataflowengine.readers.*;
 import com.test.dataflowengine.writers.*;
-import org.springframework.stereotype.Service;
-import org.springframework.beans.factory.annotation.Autowired;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
 
+import javax.sql.DataSource;
 import java.sql.Connection;
 import java.time.Duration;
 import java.time.Instant;
@@ -26,6 +26,7 @@ public class DataTransferTaskProcessor implements ITaskProcessor {
 
     @Autowired private ConnectionPoolFactory connectionPoolFactory;
 
+    // ======================== PUBLIC ENTRY ========================
     @Override
     public TaskStatus ProcessTask(ETLTask task, JobDetails job) {
         final Instant started = Instant.now();
@@ -47,8 +48,11 @@ public class DataTransferTaskProcessor implements ITaskProcessor {
             reader.open();
             writer.open();
 
-            if (parallel) runParallel(settings, reader, writer, batchSize, rollbackOnError);
-            else          runSingle(settings, reader, writer, batchSize, rollbackOnError);
+            if (parallel) {
+                runParallelStreaming(settings, reader, writer, batchSize, rollbackOnError);
+            } else {
+                runSingleThreaded(settings, reader, writer, batchSize, rollbackOnError);
+            }
 
             log.info("[ETL] Success: id={} in {} ms", task.getId(),
                     Duration.between(started, Instant.now()).toMillis());
@@ -57,8 +61,7 @@ public class DataTransferTaskProcessor implements ITaskProcessor {
         } catch (Exception ex) {
             log.error("[ETL] Failed: {}", ex.toString(), ex);
             if (writer != null && rollbackOnError) {
-                try { writer.rollback(); log.warn("[ETL] Rolled back destination changes."); }
-                catch (Exception rb) { log.error("[ETL] Rollback failed: {}", rb.toString(), rb); }
+                safeRollback(writer);
             }
             return TaskStatus.FAILURE;
 
@@ -68,126 +71,206 @@ public class DataTransferTaskProcessor implements ITaskProcessor {
         }
     }
 
-    private void runSingle(DataTaskSettings settings, DataReader reader, DataWriter writer, int batchSize, boolean rollbackOnError) throws Exception {
+    // ======================== EXECUTION MODES ========================
+    private void runSingleThreaded(DataTaskSettings settings,
+                                   DataReader reader,
+                                   DataWriter writer,
+                                   int batchSize,
+                                   boolean rollbackOnError) throws Exception {
         int total = 0, batches = 0;
         try {
             while (true) {
-                List<java.util.Map<String, Object>> batch = reader.readBatch(batchSize);
+                List<Map<String, Object>> batch = reader.readBatch(batchSize);
                 if (batch == null || batch.isEmpty()) break;
                 writer.writeBatch(batch);
-                total += batch.size(); batches++;
+                total += batch.size();
+                batches++;
             }
             writer.commit();
-            log.info("[ETL] Single-threaded wrote {} rows in {} batches.", total, batches);
+            log.info("[ETL] Single-threaded: wrote {} rows in {} batches.", total, batches);
         } catch (Exception e) {
             if (rollbackOnError) safeRollback(writer);
             throw e;
         }
     }
 
-    private void runParallel(DataTaskSettings settings, DataReader reader, DataWriter baseWriter, int batchSize, boolean rollbackOnError) throws Exception {
-        final int workers = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
-        final int queueCap = Math.max(4, workers * 2);
+    /**
+     * True streaming parallelism:
+     * - Start producer and consumers together.
+     * - Bounded queue -> natural backpressure (producer blocks when consumers lag).
+     * - Do not wait for producer first; await consumers and producer together.
+     * - DB: N writers with dedicated connections (no sharing).
+     * - FILE: N part writers + merge at end.
+     */
+    private void runParallelStreaming(DataTaskSettings settings,
+                                      DataReader reader,
+                                      DataWriter baseWriter,
+                                      int batchSize,
+                                      boolean rollbackOnError) throws Exception {
 
-        final boolean isFileDest = settings.getDestination().getType() == DataEndpointType.file;
-        SupportsPartitionFiles partCap = (baseWriter instanceof SupportsPartitionFiles)
-                ? (SupportsPartitionFiles) baseWriter : null;
+        final int workers = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
+        final int queueCapacityBatches = Math.max(4, workers * 3); // small, to keep memory bounded
+
+        final boolean isFileDest = isFile(settings.getDestination().getType());
+        final SupportsPartitionFiles partCap =
+                (baseWriter instanceof SupportsPartitionFiles) ? (SupportsPartitionFiles) baseWriter : null;
 
         if (isFileDest && partCap == null) {
             log.warn("[ETL] File destination without SupportsPartitionFiles; falling back to single-threaded.");
-            runSingle(settings, reader, baseWriter, batchSize, rollbackOnError);
+            runSingleThreaded(settings, reader, baseWriter, batchSize, rollbackOnError);
             return;
         }
 
-        List<DataWriter> writers = new ArrayList<>(workers);
+        // Build per-thread writers
+        final List<DataWriter> writers = new ArrayList<>(workers);
         try {
             if (isFileDest) {
-                for (int i=0; i<workers; i++) { DataWriter w = partCap.createPartWriter(i); w.open(); writers.add(w); }
+                for (int i = 0; i < workers; i++) {
+                    DataWriter w = partCap.createPartWriter(i);
+                    w.open();
+                    writers.add(w);
+                }
             } else {
-                for (int i=0; i<workers; i++) {
+                // Database destination: fresh instance + dedicated connection per worker
+                for (int i = 0; i < workers; i++) {
                     DataWriter w = newDatabaseWriter(settings);
                     if (w instanceof SupportsConnectionSupplier) {
                         ((SupportsConnectionSupplier) w).setConnectionSupplier(buildConnectionSupplier(settings.getDestination()));
                     }
-                    w.open(); writers.add(w);
+                    w.open();
+                    writers.add(w);
                 }
             }
 
-            BlockingQueue<List<java.util.Map<String,Object>>> q = new ArrayBlockingQueue<>(queueCap);
-            final List<java.util.Map<String,Object>> POISON = java.util.Collections.emptyList();
-            ExecutorService pool = Executors.newFixedThreadPool(workers + 1);
+            // Streaming queue (batches). Keep batches reasonably sized.
+            final BlockingQueue<List<Map<String, Object>>> queue =
+                    new ArrayBlockingQueue<>(queueCapacityBatches);
+            final List<Map<String, Object>> POISON = Collections.emptyList();
 
-            Future<?> prodF = pool.submit(() -> {
-                int produced = 0;
+            final ExecutorService pool = Executors.newFixedThreadPool(workers + 1);
+
+            // Producer starts now (does NOT preload everything)
+            final Future<?> producerF = pool.submit(() -> {
+                long produced = 0;
+                int batchNo = 0;
                 try {
                     while (true) {
-                        List<java.util.Map<String,Object>> b = reader.readBatch(batchSize);
+                        List<Map<String, Object>> b = reader.readBatch(batchSize);
                         if (b == null || b.isEmpty()) break;
-                        q.put(b); produced += b.size();
+                        batchNo++;
+                        queue.put(b); // blocks if queue is full -> backpressure
+                        produced += b.size();
+                        if ((batchNo & 15) == 0) {
+                            log.debug("[ETL] Producer queued batch#{} (rows queued so far: {})", batchNo, produced);
+                        }
                     }
-                } catch (Exception e) { throw new RuntimeException(e); }
-                finally {
-                    for (int i=0;i<writers.size();i++) { try { q.put(POISON); } catch (InterruptedException ie){ Thread.currentThread().interrupt(); } }
-                    log.info("[ETL] Producer finished. Rows queued: {}", produced);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Producer interrupted", ie);
+                } catch (Exception e) {
+                    throw new RuntimeException("Producer failed", e);
+                } finally {
+                    // Signal termination to all consumers
+                    for (int i = 0; i < workers; i++) {
+                        try { queue.put(POISON); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+                    }
+                    log.info("[ETL] Producer finished. Total rows queued: {}, batches: {}", produced, batchNo);
                 }
             });
 
-            List<Future<Long>> consFs = new ArrayList<>();
-            for (int idx=0; idx<writers.size(); idx++) {
+            // Consumers start immediately (overlap with producer)
+            final List<Future<Long>> consumerFs = new ArrayList<>(workers);
+            for (int idx = 0; idx < workers; idx++) {
                 final DataWriter w = writers.get(idx);
-                consFs.add(pool.submit(() -> {
+                final int consumerIndex = idx;
+                consumerFs.add(pool.submit(() -> {
                     long written = 0;
+                    int bno = 0;
                     try {
                         while (true) {
-                            List<java.util.Map<String,Object>> b = q.take();
+                            List<Map<String, Object>> b = queue.take();
                             if (b == POISON) break;
-                            if (!b.isEmpty()) { w.writeBatch(b); written += b.size(); }
+                            if (!b.isEmpty()) {
+                                w.writeBatch(b);
+                                written += b.size();
+                                bno++;
+                                if ((bno & 31) == 0) {
+                                    log.debug("[ETL] Consumer-{} wrote batch#{} (rows written so far: {})",
+                                            consumerIndex, bno, written);
+                                }
+                            }
                         }
                         return written;
-                    } catch (Exception ex) { throw ex; }
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Consumer-" + consumerIndex + " interrupted", ie);
+                    } catch (Exception e) {
+                        throw new RuntimeException("Consumer-" + consumerIndex + " failed", e);
+                    }
                 }));
             }
 
-            prodF.get();
+            // Wait for BOTH sides concurrently; if any consumer fails, cancel producer.
             long total = 0;
-            for (Future<Long> f : consFs) total += f.get();
+            try {
+                // As consumers finish, their get() returns; this allows true overlap during processing
+                for (Future<Long> f : consumerFs) {
+                    total += f.get(); // bubbles exceptions from consumers
+                }
+                // Only after consumers done, ensure producer has finished too
+                producerF.get(); // bubbles producer exceptions
+            } catch (Exception any) {
+                // Fail-fast: stop producer and consumers
+                producerF.cancel(true);
+                for (Future<Long> f : consumerFs) f.cancel(true);
+                throw any;
+            }
 
-            if (isFileDest) partCap.mergeParts(writers.size());
-            else for (DataWriter w : writers) w.commit();
+            // Finish / merge / commit
+            if (isFileDest) {
+                partCap.mergeParts(writers.size());
+            } else {
+                for (DataWriter w : writers) w.commit();
+            }
 
-            log.info("[ETL] Parallel write completed. Rows written: {}", total);
+            log.info("[ETL] Parallel streaming completed. Rows written: {}", total);
             pool.shutdownNow();
 
         } catch (Exception e) {
-            if (!isFileDest && rollbackOnError) for (DataWriter w : writers) safeRollback(w);
+            // On DB destination, best-effort rollback across writers if requested
+            if (!isFileDest && rollbackOnError) {
+                for (DataWriter w : writers) safeRollback(w);
+            }
             throw e;
         } finally {
             for (DataWriter w : writers) safeClose(w);
-            safeClose(baseWriter);
+            safeClose(baseWriter); // base writer not used for IO in parallel but may hold resources
         }
     }
 
+    // ======================== BUILDERS ========================
     private DataReader createReader(DataTaskSettings settings) {
         DataEndpointSettings src = settings.getSource();
-        DataEndpointType t = src.getType() == DataEndpointType.Hive ? DataEndpointType.database : src.getType();
+        DataEndpointType t = normalizeType(src.getType());
         switch (t) {
             case database: return new DatabaseReader(connectionPoolFactory, settings);
             case script:   return new ScriptReader(connectionPoolFactory, settings);
             case file: {
-                String type = safeLower(settings.getSource().getFileSettings().getFileType());
-                switch (type) {
-                    case "csv": return new CsvFileReader(settings);
+                String ft = safeLower(src.getFileSettings().getFileType());
+                switch (ft) {
+                    case "csv":   return new CsvFileReader(settings);
                     case "excel": return new ExcelFileReader(settings);
-                    case "json": return new JsonFileReader(settings);
+                    case "json":  return new JsonFileReader(settings);
+                    default: throw new IllegalArgumentException("Unsupported file source type: " + ft);
                 }
             }
+            default: throw new IllegalArgumentException("Unsupported source type: " + src.getType());
         }
-        throw new IllegalArgumentException("Unsupported source type: " + src.getType());
     }
 
     private DataWriter createWriter(DataTaskSettings settings, boolean forParallel) {
         DataEndpointSettings dest = settings.getDestination();
-        DataEndpointType t = dest.getType() == DataEndpointType.Hive ? DataEndpointType.database : dest.getType();
+        DataEndpointType t = normalizeType(dest.getType());
         switch (t) {
             case database: {
                 DataWriter w = new DatabaseWriter(connectionPoolFactory, settings);
@@ -197,34 +280,52 @@ public class DataTransferTaskProcessor implements ITaskProcessor {
                 return w;
             }
             case file: {
-                String type = safeLower(dest.getFileSettings().getFileType());
-                switch (type) {
-                    case "csv": return new CsvFileWriter(settings);
+                String ft = safeLower(dest.getFileSettings().getFileType());
+                switch (ft) {
+                    case "csv":   return new CsvFileWriter(settings);
                     case "excel": return new ExcelFileWriter(settings);
-                    case "json": return new JsonFileWriter(settings);
+                    case "json":  return new JsonFileWriter(settings);
+                    default: throw new IllegalArgumentException("Unsupported file destination type: " + ft);
                 }
             }
+            default: throw new IllegalArgumentException("Unsupported destination type: " + dest.getType());
         }
-        throw new IllegalArgumentException("Unsupported destination type: " + dest.getType());
     }
 
-    private DataWriter newDatabaseWriter(DataTaskSettings settings) { return new DatabaseWriter(connectionPoolFactory, settings); }
+    /** Only used when we need extra DB writer instances for parallel mode */
+    private DataWriter newDatabaseWriter(DataTaskSettings settings) {
+        return new DatabaseWriter(connectionPoolFactory, settings);
+    }
 
-    private java.util.function.Supplier<Connection> buildConnectionSupplier(DataEndpointSettings dest) {
+    private Supplier<Connection> buildConnectionSupplier(DataEndpointSettings dest) {
         return () -> {
             try {
-                javax.sql.DataSource dataSource = connectionPoolFactory.getDataSource(dest.getDatabaseSettings().getDatabaseId());
+                DatabaseSettings ds = dest.getDatabaseSettings();
+                DataSource dataSource = connectionPoolFactory.getDataSource(ds.getDatabaseId());
                 return dataSource.getConnection();
-            } catch (Exception e) { throw new RuntimeException("Failed to obtain destination connection", e); }
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to obtain destination connection", e);
+            }
         };
     }
 
+    // ======================== HELPERS ========================
     private static void safeClose(Object x) {
         try {
             if (x instanceof DataWriter) ((DataWriter) x).close();
             else if (x instanceof DataReader) ((DataReader) x).close();
-        } catch (Exception ignore) {}
+        } catch (Exception e) {
+            log.warn("close() failed: {}", e.toString());
+        }
     }
-    private static void safeRollback(DataWriter w) { try { if (w != null) w.rollback(); } catch (Exception ignore) {} }
-    private static String safeLower(String s){ return s==null? "" : s.trim().toLowerCase(java.util.Locale.ROOT); }
+    private static void safeRollback(DataWriter w) {
+        try { if (w != null) w.rollback(); } catch (Exception e) { log.warn("rollback() failed: {}", e.toString()); }
+    }
+    private static String safeLower(String s){ return s==null? "" : s.trim().toLowerCase(Locale.ROOT); }
+    private static boolean isFile(DataEndpointType t){ return t == DataEndpointType.file; }
+    /** Treat Hive as database for processing */
+    private static DataEndpointType normalizeType(DataEndpointType t){
+        if (t == DataEndpointType.Hive) return DataEndpointType.database;
+        return t;
+    }
 }
